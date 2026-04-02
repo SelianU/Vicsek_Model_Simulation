@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Numba cache
+__numba_cache__/
+
+# Simulation outputs
+Vicsek_Results/
+Vicsek_CPU_Results/
+Vicsek_GPU_Results/
+*.csv
+
+# Visualization outputs
+*.mp4
+*.gif
+
+# Logs
+*.log
+nohup.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
