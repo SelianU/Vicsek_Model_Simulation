@@ -94,14 +94,11 @@ __global__ void metric_cell_avg(
     else{avg_cos[i]=ci;avg_sin[i]=si;}
 }
 /*
- * backpropagate_cells — 빈 셀 역방향 전파 (GPU 전용)
+ * backpropagate_cells - empty cell backfill (GPU-side)
  *
- * 기존에는 cell_start.get()으로 CPU 복사 후 Python 루프를 돌았으나,
- * 이 커널은 GPU 내부에서 직접 처리하여 PCI-e 왕복을 완전히 제거한다.
- *
- * 알고리즘: 뒤에서부터 스캔하며, cell_start[c] == N (빈 셀)이면
- *          cell_start[c+1] 값을 복사한다.
- * 단일 스레드로 실행 (n_cells가 수천~수만이므로 충분히 빠름).
+ * Replaces the CPU-side cell_start.get() + Python loop.
+ * Scans backward: if cell_start[c] == N (empty), copy cell_start[c+1].
+ * Single-thread kernel (n_cells is O(thousands), fast enough).
  */
 __global__ void backpropagate_cells(
     int* __restrict__ cell_start,
