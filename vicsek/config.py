@@ -143,7 +143,7 @@ class SimConfig:
         if len(self.density_values) > 0:
             print(
                 f"  Density (ρ): {np.round(self.density_values, 4)}"
-                f"  →  N={list(self.n_values)}"
+                f"  →  N={[int(n) for n in self.n_values]}"
             )
         elif self.density > 0.0:
             print(f"  Density (ρ): {self.density}  →  N={self.n_values[0]}")

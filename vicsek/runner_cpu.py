@@ -60,7 +60,11 @@ class SimulationRunnerCPU:
         print(f"  병렬 workers: {cfg.num_workers}")
         print("=" * 26 + " STARTING DATA GENERATION " + "=" * 26)
 
-        with mp.Pool(processes=cfg.num_workers) as pool:
+        with mp.get_context("spawn").Pool(
+            processes=cfg.num_workers, maxtasksperchild=50,
+        ) as pool:
+            TRIAL_TIMEOUT = max(600, cfg.max_steps * 0.5)
+
             for fov_idx, fov_deg in enumerate(cfg.fov_angles_deg):
                 fov_rad = float(cfg._fov_rad[fov_idx])
                 print(f"\n>>>> FOV: {fov_deg}° <<<<")
@@ -103,28 +107,41 @@ class SimulationRunnerCPU:
                             )
 
                             pending_map = dict(work_items)
-                            task_args = [
-                                (cfg, N, fov_rad, eta, v, ti, pm)
-                                for ti, pm in work_items
-                            ]
+
+                            # apply_async로 개별 제출 (워커 행 방지)
+                            futures = {}
+                            for ti, pm in work_items:
+                                args = (cfg, N, fov_rad, eta, v, ti, pm)
+                                futures[ti] = pool.apply_async(
+                                    _trial_worker, (args,)
+                                )
 
                             done = 0
-                            cs = max(1, len(work_items) // (cfg.num_workers * 4))
-                            for ti, meas in pool.imap_unordered(
-                                _trial_worker, task_args, chunksize=cs
-                            ):
-                                for m in pending_map[ti]:
-                                    self.writer.save_trial(csv, m, ti, meas[m])
-                                done += 1
+                            failed = 0
+                            for ti, fut in futures.items():
+                                try:
+                                    result_ti, meas = fut.get(
+                                        timeout=TRIAL_TIMEOUT
+                                    )
+                                    for m in pending_map[result_ti]:
+                                        self.writer.save_trial(
+                                            csv, m, result_ti, meas[m]
+                                        )
+                                    done += 1
+                                except Exception:
+                                    failed += 1
+                                    done += 1
                                 sys.stdout.write(
                                     f"\r    진행: {done}/{len(work_items)} trials 완료"
                                 )
                                 sys.stdout.flush()
 
                             elapsed = time.perf_counter() - t_start
+                            fail_str = f"  ({failed} failed)" if failed else ""
                             print(
                                 f"\r  →  done in {elapsed:.2f}s"
                                 + (f"  (skipped {skipped})" if skipped else "")
+                                + fail_str
                             )
 
         print("\n" + "=" * 26 + " DATA GENERATION COMPLETE " + "=" * 26)
