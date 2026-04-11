@@ -9,6 +9,7 @@ Vicsek Model — 하이브리드 시뮬레이션 실행기 (CPU + GPU 동시 실
 from __future__ import annotations
 
 import multiprocessing as mp
+import gc
 import os
 import sys
 import threading
@@ -223,9 +224,14 @@ class SimulationRunnerHybrid:
         cpu_trials = sum(len(j.work_items) for j in cpu_jobs)
         gpu_trials = sum(len(j.work_items) for j in gpu_jobs)
 
+        # GPU와 동시 실행 시 CPU worker 수를 줄여 메모리 여유 확보
+        cpu_workers = cfg.num_workers
+        if gpu_jobs and cpu_jobs:
+            cpu_workers = max(1, cfg.num_workers - 2)
+
         print(f"\n  동시 실행 하이브리드 모드 (임계값 N={self.threshold})")
         print(f"  ┌─ CPU: {len(cpu_jobs)} jobs, "
-              f"{cpu_trials} trials ({cfg.num_workers} workers)")
+              f"{cpu_trials} trials ({cpu_workers} workers)")
         print(f"  └─ GPU: {len(gpu_jobs)} jobs, {gpu_trials} trials")
         if total_skipped:
             print(f"  (이미 완료: {total_skipped} jobs 스킵)")
@@ -246,7 +252,7 @@ class SimulationRunnerHybrid:
         if cpu_jobs:
             cpu_thread = threading.Thread(
                 target=self._run_cpu_batch,
-                args=(cpu_jobs, logger, cpu_error),
+                args=(cpu_jobs, cpu_workers, logger, cpu_error),
                 daemon=True,
             )
             cpu_thread.start()
@@ -270,53 +276,56 @@ class SimulationRunnerHybrid:
     # CPU 배치 (백그라운드 스레드)
     # ------------------------------------------------------------------
 
-    def _run_cpu_batch(self, jobs, logger, errors):
-        """apply_async + 타임아웃으로 워커 행 방지.
-
-        imap_unordered + chunksize>1 조합은 워커가 죽으면 해당 청크의
-        나머지 결과가 영원히 반환되지 않아 전체가 멈춘다.
-        apply_async는 task마다 독립이므로 개별 타임아웃이 가능하다.
-        """
+    def _run_cpu_batch(self, jobs, cpu_workers, logger, errors):
+        """배치 단위 제출 + 개별 타임아웃으로 메모리/행 방지."""
         cfg = self.cfg
-        # maxtasksperchild: 워커를 주기적으로 재생성하여 메모리 누수 방지
-        ctx = mp.get_context("spawn")
-        pool = ctx.Pool(processes=cfg.num_workers, maxtasksperchild=50)
+        ctx = mp.get_context("forkserver")
+        pool = ctx.Pool(processes=cpu_workers, maxtasksperchild=10)
 
-        # trial 당 타임아웃 (초). max_steps 기반 상한 추정.
         TRIAL_TIMEOUT = max(600, cfg.max_steps * 0.5)
+        BATCH_SIZE = cpu_workers * 2
 
         try:
             for job in jobs:
                 t_start = time.perf_counter()
                 pending_map = dict(job.work_items)
-                n_total = len(job.work_items)
 
-                # 모든 task를 개별 apply_async로 제출
-                futures = {}
-                for ti, pm in job.work_items:
-                    args = (cfg, job.N, job.fov_rad, job.eta, job.v, ti, pm)
-                    futures[ti] = pool.apply_async(
-                        _cpu_trial_worker, (args,)
-                    )
-
-                # 결과 수집 (개별 타임아웃)
-                done = 0
+                job_results = {}
                 failed = []
-                for ti, fut in futures.items():
-                    try:
-                        result_ti, meas = fut.get(timeout=TRIAL_TIMEOUT)
-                        for m in pending_map[result_ti]:
-                            self.writer.save_trial(
-                                job.csv_path, m, result_ti, meas[m]
-                            )
-                        done += 1
-                        logger.tick_cpu_trial()
-                    except mp.TimeoutError:
-                        failed.append(ti)
-                        logger.tick_cpu_trial()  # 카운터는 진행
-                    except Exception as e:
-                        failed.append(ti)
-                        logger.tick_cpu_trial()
+
+                # 배치 단위로 제출 → 수집 → 다음 배치
+                for b_start in range(0, len(job.work_items), BATCH_SIZE):
+                    batch = job.work_items[b_start : b_start + BATCH_SIZE]
+
+                    futures = {}
+                    for ti, pm in batch:
+                        args = (cfg, job.N, job.fov_rad, job.eta, job.v, ti, pm)
+                        futures[ti] = pool.apply_async(
+                            _cpu_trial_worker, (args,)
+                        )
+
+                    for ti, fut in futures.items():
+                        try:
+                            result_ti, meas = fut.get(timeout=TRIAL_TIMEOUT)
+                            for m in pending_map[result_ti]:
+                                job_results[(m, result_ti)] = meas[m]
+                            del meas
+                            logger.tick_cpu_trial()
+                        except mp.TimeoutError:
+                            failed.append(ti)
+                            logger.tick_cpu_trial()
+                        except Exception:
+                            failed.append(ti)
+                            logger.tick_cpu_trial()
+
+                    del futures
+                    gc.collect()
+
+                # 일괄 저장
+                self.writer.save_job(job.csv_path, job_results)
+                del job_results
+                self.writer.clear_cache(job.csv_path)
+                gc.collect()
 
                 elapsed = time.perf_counter() - t_start
 
@@ -344,18 +353,33 @@ class SimulationRunnerHybrid:
         cfg = self.cfg
         sim = VicsekSimulatorGPU(cfg)
         runner = TrialRunner(sim, xp=cp)
+        mempool = cp.get_default_memory_pool()
+        pinned_pool = cp.get_default_pinned_memory_pool()
 
         for job in jobs:
             t_start = time.perf_counter()
             cfg.set_velocity(job.v)
 
+            # job 단위로 결과 수집 후 일괄 저장
+            job_results = {}  # {(model, trial_idx): meas_array}
+
             for trial_idx, pending in job.work_items:
-                results = runner.run(job.N, job.fov_rad, job.eta)
+                trial_meas = runner.run(job.N, job.fov_rad, job.eta)
                 for m in pending:
-                    self.writer.save_trial(
-                        job.csv_path, m, trial_idx, results[m]
-                    )
+                    job_results[(m, trial_idx)] = trial_meas[m]
+                del trial_meas
                 logger.tick_gpu_trial()
+
+            # 일괄 저장 (CSV read/write 1회)
+            self.writer.save_job(job.csv_path, job_results)
+            del job_results
+
+            # GPU 메모리 풀 해제 (OS에 반환)
+            mempool.free_all_blocks()
+            pinned_pool.free_all_blocks()
+
+            # done_cache 해당 키 정리
+            self.writer.clear_cache(job.csv_path)
 
             elapsed = time.perf_counter() - t_start
             logger.job_done("GPU", job, elapsed)

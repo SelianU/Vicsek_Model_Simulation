@@ -54,6 +54,7 @@ class SimulationRunnerGPU:
                         csv = self.writer.csv_path(fov_deg, N, eta, v)
 
                         skipped = 0
+                        work_items = []
                         for trial in range(cfg.num_trials):
                             pending = [
                                 m for m in models_active
@@ -61,23 +62,47 @@ class SimulationRunnerGPU:
                             ]
                             if not pending:
                                 skipped += 1
-                                continue
+                            else:
+                                work_items.append((trial, pending))
 
-                            sys.stdout.write(
-                                f"\r  Sim {counter}/{total} "
+                        if not work_items:
+                            print(
+                                f"  Sim {counter}/{total} "
                                 f"(FOV={fov_deg}, N={N}, η={eta:.3f}, v={v:.4f}) "
-                                f"| Trial {trial + 1}/{cfg.num_trials}"
-                                + (f" [skip {skipped}]" if skipped else "")
+                                f"— 전체 완료, 스킵"
+                            )
+                            continue
+
+                        print(
+                            f"  Sim {counter}/{total} "
+                            f"(FOV={fov_deg}, N={N}, η={eta:.3f}, v={v:.4f}) "
+                            f"| {len(work_items)} trials"
+                            + (f" [{skipped} skipped]" if skipped else ""),
+                            flush=True,
+                        )
+
+                        job_results = {}
+                        for trial, pending in work_items:
+                            trial_meas = self.runner.run(N, fov_rad, eta)
+                            for m in pending:
+                                job_results[(m, trial)] = trial_meas[m]
+                            del trial_meas
+                            sys.stdout.write(
+                                f"\r    진행: {len(job_results)}/{len(work_items)} trials"
                             )
                             sys.stdout.flush()
 
-                            results = self.runner.run(N, fov_rad, eta)
-                            for m in pending:
-                                self.writer.save_trial(csv, m, trial, results[m])
+                        self.writer.save_job(csv, job_results)
+                        del job_results
+
+                        # GPU 메모리 풀 해제
+                        cp.get_default_memory_pool().free_all_blocks()
+                        cp.get_default_pinned_memory_pool().free_all_blocks()
+                        self.writer.clear_cache(csv)
 
                         elapsed = time.perf_counter() - t_start
                         print(
-                            f"  →  done in {elapsed:.2f}s"
+                            f"\r  →  done in {elapsed:.2f}s"
                             + (f"  (skipped {skipped} trials)" if skipped else "")
                         )
 

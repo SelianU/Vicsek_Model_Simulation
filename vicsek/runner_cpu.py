@@ -6,6 +6,7 @@ Vicsek Model — CPU 시뮬레이션 실행기
 from __future__ import annotations
 
 import multiprocessing as mp
+import gc
 import os
 import sys
 import time
@@ -60,10 +61,11 @@ class SimulationRunnerCPU:
         print(f"  병렬 workers: {cfg.num_workers}")
         print("=" * 26 + " STARTING DATA GENERATION " + "=" * 26)
 
-        with mp.get_context("spawn").Pool(
-            processes=cfg.num_workers, maxtasksperchild=50,
+        with mp.get_context("forkserver").Pool(
+            processes=cfg.num_workers, maxtasksperchild=10,
         ) as pool:
             TRIAL_TIMEOUT = max(600, cfg.max_steps * 0.5)
+            BATCH_SIZE = cfg.num_workers * 2  # 동시 제출 제한
 
             for fov_idx, fov_deg in enumerate(cfg.fov_angles_deg):
                 fov_rad = float(cfg._fov_rad[fov_idx])
@@ -107,34 +109,46 @@ class SimulationRunnerCPU:
                             )
 
                             pending_map = dict(work_items)
-
-                            # apply_async로 개별 제출 (워커 행 방지)
-                            futures = {}
-                            for ti, pm in work_items:
-                                args = (cfg, N, fov_rad, eta, v, ti, pm)
-                                futures[ti] = pool.apply_async(
-                                    _trial_worker, (args,)
-                                )
-
+                            job_results = {}
                             done = 0
                             failed = 0
-                            for ti, fut in futures.items():
-                                try:
-                                    result_ti, meas = fut.get(
-                                        timeout=TRIAL_TIMEOUT
+
+                            # 배치 단위로 제출 → 수집 → 다음 배치
+                            for b_start in range(0, len(work_items), BATCH_SIZE):
+                                batch = work_items[b_start : b_start + BATCH_SIZE]
+
+                                futures = {}
+                                for ti, pm in batch:
+                                    a = (cfg, N, fov_rad, eta, v, ti, pm)
+                                    futures[ti] = pool.apply_async(
+                                        _trial_worker, (a,)
                                     )
-                                    for m in pending_map[result_ti]:
-                                        self.writer.save_trial(
-                                            csv, m, result_ti, meas[m]
+
+                                for ti, fut in futures.items():
+                                    try:
+                                        result_ti, meas = fut.get(
+                                            timeout=TRIAL_TIMEOUT
                                         )
-                                    done += 1
-                                except Exception:
-                                    failed += 1
-                                    done += 1
-                                sys.stdout.write(
-                                    f"\r    진행: {done}/{len(work_items)} trials 완료"
-                                )
-                                sys.stdout.flush()
+                                        for m in pending_map[result_ti]:
+                                            job_results[(m, result_ti)] = meas[m]
+                                        del meas
+                                        done += 1
+                                    except Exception:
+                                        failed += 1
+                                        done += 1
+                                    sys.stdout.write(
+                                        f"\r    진행: {done}/{len(work_items)} trials 완료"
+                                    )
+                                    sys.stdout.flush()
+
+                                del futures
+                                gc.collect()
+
+                            # 일괄 저장
+                            self.writer.save_job(csv, job_results)
+                            del job_results
+                            self.writer.clear_cache(csv)
+                            gc.collect()
 
                             elapsed = time.perf_counter() - t_start
                             fail_str = f"  ({failed} failed)" if failed else ""
